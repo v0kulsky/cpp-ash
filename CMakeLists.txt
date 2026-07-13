@@ -15,7 +15,8 @@ find_package(SDL3 REQUIRED)
 ### ENTRY POINT ###
 add_library(${PROJECT_NAME}
   STATIC
-  src/library.cpp)
+  src/engine.cpp
+  src/music.cpp)
 
 target_include_directories(${PROJECT_NAME}
   PUBLIC include)
