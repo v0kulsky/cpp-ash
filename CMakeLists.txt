@@ -19,7 +19,8 @@ add_library(${PROJECT_NAME}
   src/music.cpp)
 
 target_include_directories(${PROJECT_NAME}
-  PUBLIC include)
+  PUBLIC include
+  PUBLIC third_party/minimp3)
 
 target_link_libraries(${PROJECT_NAME}
   PRIVATE SDL3::SDL3)
