@@ -16,7 +16,8 @@ find_package(SDL3 REQUIRED)
 add_library(${PROJECT_NAME}
   STATIC
   src/engine.cpp
-  src/music.cpp)
+  src/data_source.cpp
+  src/audio_stream.cpp)
 
 target_include_directories(${PROJECT_NAME}
   PUBLIC include
