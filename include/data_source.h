@@ -3,8 +3,8 @@
 #include <cstdint>
 #include <span>
 #include <vector>
-
-// #include <ring_bufer.h>
+#include <filesystem>
+#include <fstream>
 
 namespace ash
 {
@@ -34,20 +34,21 @@ private:
     size_t position = 0;
 };
 
-// class StreamingDataSource : public DataSource
-// {
-// public:
-//     ~StreamingDataSource() override = default;
+class StreamingDataSource : public DataSource
+{
+public:
+    StreamingDataSource(const std::filesystem::path& path);
+    ~StreamingDataSource() override = default;
 
-//     size_t read(std::span<std::uint8_t> buffer) override;
-//     bool eof() const override;
-//     const size_t size() const override;
+    size_t read(std::span<std::uint8_t> buffer) override;
+    bool eof() const override;
+    const size_t size() const override;
 
-//     void push(std::span<const uint8_t> data);
+    bool is_ok() const;
 
-// private:
-//     RingBuffer<std::uint8_t, 512> file_data;
-//     bool finished = false;
-// };
+private:
+    std::ifstream file;
+    size_t file_size = 0;
+};
 
 }

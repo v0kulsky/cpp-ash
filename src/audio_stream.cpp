@@ -1,4 +1,7 @@
 #include <iostream>
+#include <chrono>
+#include <cstring>
+#include <cassert>
 #include <SDL3/SDL.h>
 
 #define MINIMP3_ONLY_MP3
@@ -10,6 +13,13 @@
 void AudioStreamDeleter::operator()(SDL_AudioStream* stream) const
 {
     SDL_DestroyAudioStream(stream);
+}
+
+namespace
+{
+    constexpr std::size_t SAFE_BUFFER_THRESHOLD = 2048;
+    constexpr std::size_t STREAM_QUEUED_BYTES_THRESHOLD = 96000;
+    constexpr std::size_t STREAM_FEEDING_SAMPLES = 8192;
 }
 
 namespace ash
@@ -31,30 +41,67 @@ AudioStream::AudioStream(std::unique_ptr<DataSource> data_source)
 
 AudioStream::~AudioStream()
 {
-    if (this->stream)
-    {
-        stop();
-    }
+    stop();
 }
 
 void AudioStream::play()
 {
-    if (this->stream)
-    {
-        SDL_ClearAudioStream(this->stream.get());
-        this->stream = nullptr;
-    }
-
-    auto result = decode_whole_mp3_file();
-
-    if (!result.has_value())
+    if (this->is_playing)
     {
         return;
     }
 
-    auto decoded_result = result.value();
+    this->is_playing = true;
+
+    this->workers[0] = std::thread(&AudioStream::decode_mp3_thr, this);
+    this->workers[1] = std::thread(&AudioStream::play_audio_thr, this);
+
+    return;
+}
+
+void AudioStream::pause()
+{
+    if (!SDL_PauseAudioDevice(this->device))
+    {
+        std::cerr << "SDL_PauseAudioDevice failed: " << SDL_GetError() << '\n';
+        return;
+    }
+}
+
+void AudioStream::resume()
+{
+    if (!SDL_ResumeAudioDevice(this->device))
+    {
+        std::cerr << "SDL_ResumeAudioDevice failed: " << SDL_GetError() << '\n';
+        return;
+    }
+}
+
+void AudioStream::stop()
+{
+    this->is_playing = false;
+
+    this->pcm_buffer.finish();
+
+    for (auto& w : this->workers)
+    {
+        if (w.joinable())
+        {
+            w.join();
+        }
+    }
+
+    this->stream.reset();
+
+    SDL_CloseAudioDevice(this->device);
+}
+
+void AudioStream::play_audio_thr()
+{
+    std::array<int16_t, STREAM_FEEDING_SAMPLES> chunk;
 
     SDL_AudioSpec device_spec{};
+    SDL_AudioSpec source_spec{};
 
     if (!SDL_GetAudioDeviceFormat(this->device, &device_spec, nullptr))
     {
@@ -63,10 +110,11 @@ void AudioStream::play()
         return;
     }
 
-    SDL_AudioSpec source_spec{};
+    this->first_frame_read.acquire();
+
     source_spec.format = SDL_AUDIO_S16;
-    source_spec.freq = decoded_result.sample_rate;
-    source_spec.channels = decoded_result.channels;
+    source_spec.freq = this->info.hz;
+    source_spec.channels = this->info.channels;
 
     this->stream.reset(SDL_CreateAudioStream(&source_spec, &device_spec));
 
@@ -82,102 +130,96 @@ void AudioStream::play()
         return;
     }
 
-    if (!SDL_PutAudioStreamData(this->stream.get(),
-                                decoded_result.pcm.data(),
-                                static_cast<int>(decoded_result.pcm.size() * sizeof(int16_t))))
+    while (this->is_playing)
     {
-        std::cerr << "SDL_PutAudioStreamData failed: " << SDL_GetError()
-                  << '\n';
-        return;
-    }
-
-    if (!SDL_ResumeAudioDevice(this->device))
-    {
-        std::cerr << "SDL_ResumeAudioDevice failed: " << SDL_GetError() << '\n';
-        return;
-    }
-
-    return;
-}
-
-void AudioStream::pause()
-{
-    if (!SDL_PauseAudioDevice(this->device))
-    {
-        std::cerr << "SDL_PauseAudioDevice failed: " << SDL_GetError() << '\n';
-        return;
-    }
-
-    return;
-}
-
-void AudioStream::resume()
-{
-    if (!SDL_ResumeAudioDevice(this->device))
-    {
-        std::cerr << "SDL_ResumeAudioDevice failed: " << SDL_GetError() << '\n';
-        return;
-    }
-
-    return;
-}
-
-void AudioStream::stop()
-{
-    SDL_ClearAudioStream(this->stream.get());
-    this->stream = nullptr;
-
-    SDL_CloseAudioDevice(this->device);
-}
-
-std::optional<DecodingResult> AudioStream::decode_whole_mp3_file()
-{
-    DecodingResult result;
-
-    const size_t size_of_file = this->data_source->size();
-    std::vector<uint8_t> file_data(size_of_file);
-
-    this->data_source->read(file_data);
-
-    uint8_t* input = file_data.data();
-    size_t remaining = file_data.size();
-
-    while (remaining > 0)
-    {
-        mp3dec_frame_info_t info{};
-
-        int16_t buffer[MINIMP3_MAX_SAMPLES_PER_FRAME];
-
-        int samples = mp3dec_decode_frame(&this->decoder,
-                                          input,
-                                          remaining,
-                                          buffer,
-                                          &info);
-
-        if (info.frame_bytes == 0)
-            break;
-
-        input += info.frame_bytes;
-        remaining -= info.frame_bytes;
-
-        if (samples > 0)
+        // check if SDL_AudioStream needs feeding
+        while (SDL_GetAudioStreamQueued(this->stream.get()) < STREAM_QUEUED_BYTES_THRESHOLD)
         {
-            result.sample_rate = info.hz;
-            result.channels = info.channels;
+            // get data from pcm_buffer into continuous chunk
+            std::size_t samples_read =
+                this->pcm_buffer.blocking_read(chunk.data() , chunk.size());
 
-            result.pcm.insert(result.pcm.end(),
-                              buffer,
-                              buffer + samples * result.channels);
+            if (samples_read == 0)
+            {
+                return;
+            }
+
+            // feed the chunk to SDL_PutAudioStreamData
+            if (!SDL_PutAudioStreamData(this->stream.get(), chunk.data(),
+                                        static_cast<int>(samples_read * sizeof(int16_t))))
+            {
+                std::cerr << "SDL_PutAudioStreamData failed: " << SDL_GetError()
+                          << '\n';
+                return;
+            }
         }
     }
+}
 
-    if (result.pcm.empty())
+void AudioStream::decode_mp3_thr()
+{
+    int samples;
+    bool first_frame_ready = false;
+    std::size_t encoded_size = 0;
+    std::size_t bytes_read;
+    std::size_t remaining;
+
+    while (this->is_playing)
     {
-        std::cerr << "No audio decoded\n";
-        return std::nullopt;
-    }
+        bytes_read =
+            this->data_source->read(std::span(this->encoded_buffer.data() + encoded_size,
+                                              this->encoded_buffer.size() - encoded_size));
 
-    return result;
+        if (bytes_read == 0)
+        {
+            this->first_frame_read.release();
+            this->pcm_buffer.finish();
+            break;
+        }
+
+        encoded_size += bytes_read;
+        remaining = encoded_size;
+
+        uint8_t* input = this->encoded_buffer.data();
+
+        while (remaining > 0 && this->is_playing)
+        {
+            // keep remaining buffer bytes in safe range 
+            if (remaining < SAFE_BUFFER_THRESHOLD)
+            {
+                break; 
+            }
+
+            samples = mp3dec_decode_frame(&this->decoder, input, remaining,
+                                          this->decoded_buffer.data(), &this->info);
+
+            if (samples <= 0)
+            {
+                input += 1;
+                remaining -= 1;
+                continue;
+            }
+
+            input += this->info.frame_bytes;
+            remaining -= this->info.frame_bytes;
+
+            this->pcm_buffer.blocking_write(this->decoded_buffer.data(),
+                                            samples * this->info.channels);
+
+            if (!first_frame_ready)
+            {
+                first_frame_ready = true;
+                first_frame_read.release();
+            }
+        }
+
+        if (remaining > 0 && this->is_playing)
+        {
+            std::memmove(this->encoded_buffer.data(), input, remaining);
+        }
+
+        encoded_size = remaining;
+    }
 }
 
 }
