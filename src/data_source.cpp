@@ -3,6 +3,7 @@
 #include <iostream>
 
 #include "data_source.h"
+#include "shlogger.hpp"
 
 namespace ash
 {
@@ -19,6 +20,9 @@ size_t MemoryDataSource::read(std::span<std::uint8_t> buffer)
     std::memcpy(buffer.data(), file_data.data() + position, bytes_to_read);
 
     position += bytes_to_read;
+
+    LOG_DEBUG("MemoryDataSource::read: Read {} bytes of in-memory data.",
+              bytes_to_read);
 
     return bytes_to_read;
 }
@@ -40,6 +44,10 @@ StreamingDataSource::StreamingDataSource(const std::filesystem::path& path)
     {
         this->file_size = static_cast<size_t>(std::filesystem::file_size(path));
     }
+    else
+    {
+        LOG_ERROR("StreamingDataSrouce: File {} cannot be opened.", path.string());
+    }
 }
 
 size_t StreamingDataSource::read(std::span<std::uint8_t> buffer)
@@ -52,6 +60,9 @@ size_t StreamingDataSource::read(std::span<std::uint8_t> buffer)
     this->file.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
 
     const size_t bytes_read = static_cast<size_t>(this->file.gcount());
+
+    LOG_DEBUG("StreamingDataSource::read: Read {} bytes of streamed data.",
+              bytes_read);
 
     return bytes_read;
 }

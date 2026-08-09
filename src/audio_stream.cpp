@@ -10,6 +10,9 @@
 
 #include "audio_stream.h"
 
+#define SHLOGGER_IMPL
+#include "shlogger.hpp"
+
 void AudioStreamDeleter::operator()(SDL_AudioStream* stream) const
 {
     SDL_DestroyAudioStream(stream);
@@ -34,7 +37,7 @@ AudioStream::AudioStream(std::unique_ptr<DataSource> data_source)
 
     if (!this->device)
     {
-        std::cerr << "SDL_OpenAudioDevice failed: " << SDL_GetError() << '\n';
+        LOG_ERROR("AudioStream: SDL_OpenAudioDevice failed: {}", SDL_GetError());
         return;
     }
 }
@@ -63,7 +66,7 @@ void AudioStream::pause()
 {
     if (!SDL_PauseAudioDevice(this->device))
     {
-        std::cerr << "SDL_PauseAudioDevice failed: " << SDL_GetError() << '\n';
+        LOG_ERROR("AudioStream::pause: Pausing failed: {}", SDL_GetError());
         return;
     }
 }
@@ -72,7 +75,7 @@ void AudioStream::resume()
 {
     if (!SDL_ResumeAudioDevice(this->device))
     {
-        std::cerr << "SDL_ResumeAudioDevice failed: " << SDL_GetError() << '\n';
+        LOG_ERROR("AudioStream::resume: Resuming failed: {}", SDL_GetError());
         return;
     }
 }
@@ -105,8 +108,8 @@ void AudioStream::play_audio_thr()
 
     if (!SDL_GetAudioDeviceFormat(this->device, &device_spec, nullptr))
     {
-        std::cerr << "SDL_GetAudioDeviceFormat failed: " << SDL_GetError()
-                  << '\n';
+        LOG_ERROR("AudioStream::play_audio_thr: SDL_GetAudioDeviceFormat failed: {}",
+                  SDL_GetError());
         return;
     }
 
@@ -120,39 +123,57 @@ void AudioStream::play_audio_thr()
 
     if (!this->stream)
     {
-        std::cerr << "SDL_CreateAudioStream failed: " << SDL_GetError() << '\n';
+        LOG_ERROR("AudioStream::play_audio_thr: SDL_CreateAudioStream failed: {}",
+                  SDL_GetError());
         return;
     }
 
     if (!SDL_BindAudioStream(this->device, this->stream.get()))
     {
-        std::cerr << "SDL_BindAudioStream failed: " << SDL_GetError() << '\n';
+        LOG_ERROR("AudioStream::play_audio_thr: SDL_BindAudioStream failed: {}",
+                  SDL_GetError());
         return;
     }
 
     while (this->is_playing)
     {
         // check if SDL_AudioStream needs feeding
-        while (SDL_GetAudioStreamQueued(this->stream.get()) < STREAM_QUEUED_BYTES_THRESHOLD)
+        if (SDL_GetAudioStreamQueued(this->stream.get()) >= STREAM_QUEUED_BYTES_THRESHOLD)
         {
-            // get data from pcm_buffer into continuous chunk
-            std::size_t samples_read =
-                this->pcm_buffer.blocking_read(chunk.data() , chunk.size());
-
-            if (samples_read == 0)
-            {
-                return;
-            }
-
-            // feed the chunk to SDL_PutAudioStreamData
-            if (!SDL_PutAudioStreamData(this->stream.get(), chunk.data(),
-                                        static_cast<int>(samples_read * sizeof(int16_t))))
-            {
-                std::cerr << "SDL_PutAudioStreamData failed: " << SDL_GetError()
-                          << '\n';
-                return;
-            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
         }
+
+        LOG_DEBUG("AudioStream::play_audio_thr: "
+                  "[1] Audio stream fed with {} bytes.",
+                  SDL_GetAudioStreamQueued(this->stream.get()));
+
+        // get data from pcm_buffer into continuous chunk
+        std::size_t samples_read =
+            this->pcm_buffer.blocking_read(chunk.data() , chunk.size());
+
+        LOG_DEBUG("AudioStream::play_audio_thr: Read {} pcm samples from "
+                  "ring buffer (size = {}).",
+                  samples_read, this->pcm_buffer.get_size());
+
+        if (samples_read == 0)
+        {
+            return;
+        }
+
+        // feed the chunk to SDL_PutAudioStreamData
+        if (!SDL_PutAudioStreamData(this->stream.get(), chunk.data(),
+                                    static_cast<int>(samples_read * sizeof(int16_t))))
+        {
+            LOG_ERROR("AudioStream::play_audio_thr: "
+                      "SDL_PutAudioStreamData failed: {}",
+                      SDL_GetError());
+            return;
+        }
+
+        LOG_DEBUG("AudioStream::play_audio_thr: "
+                  "[2] Audio stream fed with {} bytes.",
+                  SDL_GetAudioStreamQueued(this->stream.get()));
     }
 }
 
@@ -170,6 +191,9 @@ void AudioStream::decode_mp3_thr()
             this->data_source->read(std::span(this->encoded_buffer.data() + encoded_size,
                                               this->encoded_buffer.size() - encoded_size));
 
+        LOG_DEBUG("AudioStream::decode_mp3_thr: Read {} bytes from data source.",
+                  bytes_read);
+
         if (bytes_read == 0)
         {
             this->first_frame_read.release();
@@ -182,12 +206,16 @@ void AudioStream::decode_mp3_thr()
 
         uint8_t* input = this->encoded_buffer.data();
 
+        LOG_DEBUG("AudioStream::decode_mp3_thr: Entering decoding inner loop "
+                  "with remaining = {} and encoded_size = {}",
+                  remaining, encoded_size);
+
         while (remaining > 0 && this->is_playing)
         {
-            // keep remaining buffer bytes in safe range 
+            // keep remaining buffer bytes in safe range
             if (remaining < SAFE_BUFFER_THRESHOLD)
             {
-                break; 
+                break;
             }
 
             samples = mp3dec_decode_frame(&this->decoder, input, remaining,
@@ -195,13 +223,21 @@ void AudioStream::decode_mp3_thr()
 
             if (samples <= 0)
             {
-                input += 1;
-                remaining -= 1;
+                LOG_DEBUG("AudioStream::decode_mp3_thr: Minimp3 decoded 0 or less samples. a frame_bytes {}", this->info.frame_bytes);
+
+                input += this->info.frame_bytes;
+                remaining -= this->info.frame_bytes;
+
                 continue;
             }
 
             input += this->info.frame_bytes;
             remaining -= this->info.frame_bytes;
+
+            LOG_DEBUG("AudioStream::decode_mp3_thr: Going to write {} "
+                      "pcm samples to ring buffer (size = {}).",
+                      samples * this->info.channels,
+                      this->pcm_buffer.get_size());
 
             this->pcm_buffer.blocking_write(this->decoded_buffer.data(),
                                             samples * this->info.channels);
