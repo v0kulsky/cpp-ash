@@ -49,12 +49,13 @@ AudioStream::~AudioStream()
 
 void AudioStream::play()
 {
-    if (this->is_playing)
+    if (this->alive)
     {
         return;
     }
 
-    this->is_playing = true;
+    this->alive = true;
+    this->playing = true;
 
     this->workers[0] = std::thread(&AudioStream::decode_mp3_thr, this);
     this->workers[1] = std::thread(&AudioStream::play_audio_thr, this);
@@ -64,25 +65,40 @@ void AudioStream::play()
 
 void AudioStream::pause()
 {
+    if (!this->alive || !this->playing)
+    {
+        return;
+    }
+
     if (!SDL_PauseAudioDevice(this->device))
     {
         LOG_ERROR("AudioStream::pause: Pausing failed: {}", SDL_GetError());
         return;
     }
+
+    this->playing = false;
 }
 
 void AudioStream::resume()
 {
+    if (!this->alive || this->playing)
+    {
+        return;
+    }
+
     if (!SDL_ResumeAudioDevice(this->device))
     {
         LOG_ERROR("AudioStream::resume: Resuming failed: {}", SDL_GetError());
         return;
     }
+
+    this->playing = true;
 }
 
 void AudioStream::stop()
 {
-    this->is_playing = false;
+    this->alive = false;
+    this->playing = false;
 
     this->pcm_buffer.finish();
 
@@ -97,6 +113,11 @@ void AudioStream::stop()
     this->stream.reset();
 
     SDL_CloseAudioDevice(this->device);
+}
+
+bool AudioStream::is_playing() const
+{
+    return this->playing;
 }
 
 void AudioStream::play_audio_thr()
@@ -135,7 +156,7 @@ void AudioStream::play_audio_thr()
         return;
     }
 
-    while (this->is_playing)
+    while (this->alive)
     {
         // check if SDL_AudioStream needs feeding
         if (SDL_GetAudioStreamQueued(this->stream.get()) >= STREAM_QUEUED_BYTES_THRESHOLD)
@@ -185,7 +206,7 @@ void AudioStream::decode_mp3_thr()
     std::size_t bytes_read;
     std::size_t remaining;
 
-    while (this->is_playing)
+    while (this->alive)
     {
         bytes_read =
             this->data_source->read(std::span(this->encoded_buffer.data() + encoded_size,
@@ -210,7 +231,7 @@ void AudioStream::decode_mp3_thr()
                   "with remaining = {} and encoded_size = {}",
                   remaining, encoded_size);
 
-        while (remaining > 0 && this->is_playing)
+        while (remaining > 0 && this->alive)
         {
             // keep remaining buffer bytes in safe range
             if (remaining < SAFE_BUFFER_THRESHOLD)
@@ -249,7 +270,7 @@ void AudioStream::decode_mp3_thr()
             }
         }
 
-        if (remaining > 0 && this->is_playing)
+        if (remaining > 0 && this->alive)
         {
             std::memmove(this->encoded_buffer.data(), input, remaining);
         }

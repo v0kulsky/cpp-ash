@@ -41,6 +41,8 @@ public:
     void resume();
     void stop();
 
+    bool is_playing() const;
+
 private:
     void play_audio_thr();
     void decode_mp3_thr();
@@ -60,7 +62,8 @@ private:
 
     AudioDeviceID device = 0;
 
-    bool is_playing = false;
+    bool playing = false;
+    bool alive = false;
 };
 
 }
